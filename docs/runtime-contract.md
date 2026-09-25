@@ -36,7 +36,7 @@
 
 ## Headless worker
 
-worker 每个输入引用独占一个进程。manager 使用 `stdin=DEVNULL`，后台消费 stderr，轮询 `ping`，ready 后才注册。关闭先 `terminate()` 并等待，超时才 `kill()`。启动失败不留下 registry record。
+worker 每个输入引用独占一个进程。manager 使用 `stdin=DEVNULL`，从 stdout 读取一行 `LOCAL_RUNTIME_ENDPOINT <json>` 握手；worker 必须先自行绑定 loopback 随机端口，再立即 flush 它实际绑定的 `host`、`port` 和 `path`。manager 只对握手返回的 endpoint 轮询 `ping`，ready 后才注册，因此不存在先探测再释放临时端口的窗口。stdout 握手之后的内容会被持续消费但不会被解释，stderr 也会持续 drain；诊断日志写入 stderr。启动失败不留下 registry record。关闭先 `terminate()` 并等待，超时才 `kill()`。
 
 manager 持有每个 headless session 的 lease 并定期 heartbeat；lease 丢失时回收对应 worker。控制面只能关闭 manager 自己拥有的 headless session，GUI session 必须由其 `MultiModeRuntime` owner 关闭。
 

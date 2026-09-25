@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from typing import TYPE_CHECKING, Protocol
 
@@ -84,7 +85,8 @@ class MultiModeRuntime:
     def _heartbeat_loop(self, interval: float) -> None:
         """Renew the lease until shutdown or ownership loss."""
         while not self._stop.wait(interval):
-            record = self.record
+            with self._lock:
+                record = self.record
             if record is None:
                 return
             if self.registry.heartbeat(record.session_id, record.lease_id):
@@ -94,6 +96,10 @@ class MultiModeRuntime:
                     return
                 self.record = None
                 self._stop.set()
+            with contextlib.suppress(Exception):
+                self.registry.expire(
+                    record.session_id, "lease_lost", lease_id=record.lease_id
+                )
             try:
                 self.adapter.stop()
             except Exception:  # noqa: BLE001

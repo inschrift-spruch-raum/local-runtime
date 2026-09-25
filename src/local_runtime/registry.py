@@ -42,6 +42,9 @@ class InstanceRegistry:
 
     def register(self, registration: Registration) -> InstanceRecord:
         """Publish a ready endpoint and return its lease-bearing record."""
+        if registration.endpoint.port == 0:
+            msg = "registry endpoints must use a bound port"
+            raise ValueError(msg)
         now = _now()
         with FileLock(str(self.lock_path)):
             data = self._read()
@@ -122,17 +125,19 @@ class InstanceRegistry:
             self._write(data)
             return True
 
-    def expire(self, session_id: str, reason: str) -> bool:
-        """Move an active session to the bounded expired history."""
+    def expire(self, session_id: str, reason: str, lease_id: str | None = None) -> bool:
+        """Move an owned active session to the bounded expired history."""
         with FileLock(str(self.lock_path)):
             data = self._read()
             sessions = _sessions(data)
-            value = sessions.pop(session_id, None)
-            if not isinstance(value, dict):
+            value = sessions.get(session_id)
+            record = _record_or_none(value)
+            if record is None or (lease_id is not None and record.lease_id != lease_id):
                 return False
+            del sessions[session_id]
             expired = _expired(data)
             expired[session_id] = {
-                "record": value,
+                "record": record.to_json(),
                 "reason": reason,
                 "expired_at": _now().isoformat(),
             }
@@ -200,7 +205,7 @@ class InstanceRegistry:
                 "active_session": value.get("active_session"),
                 "expired": expired,
             }
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        except OSError, TypeError, ValueError, json.JSONDecodeError:
             self._quarantine()
             return _empty_store()
 
@@ -259,7 +264,7 @@ def _record_or_none(value: object) -> InstanceRecord | None:
     """Parse a record while treating malformed external state as absent."""
     try:
         return InstanceRecord.from_json(value)
-    except (KeyError, TypeError, ValueError, OverflowError):
+    except KeyError, TypeError, ValueError, OverflowError:
         return None
 
 
@@ -279,4 +284,3 @@ def _expired(data: dict[str, object]) -> dict[str, object]:
         msg = "registry expired sessions are invalid"
         raise TypeError(msg)
     return cast("dict[str, object]", value)
-

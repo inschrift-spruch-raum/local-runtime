@@ -46,6 +46,7 @@ def test_notification_does_not_emit_a_response() -> None:
 
 def test_null_request_id_is_preserved_in_response() -> None:
     """Verify a JSON-RPC null id is accepted and echoed by the transport."""
+
     def handler(method: str, params: JsonObject) -> JsonValue:
         del method, params
         return True

@@ -56,14 +56,14 @@ runtime.stop()
 
 `dispatcher(method, params)`、`execution_gate(call)`、worker command factory 和工具目录是具体程序注入的 seams。框架不会导入或命名具体工具，也不会猜测宿主的线程模型。
 
-无头模式使用 `HeadlessSessionManager`，通过 `WorkerCommandFactory(input_ref, endpoint)` 生成命令。worker 必须在准备好同一 JSON-RPC endpoint 后响应 `ping`；manager 只有在 ready 后才写入注册表。
+无头模式使用 `HeadlessSessionManager`，通过 `WorkerCommandFactory(input_ref, endpoint)` 生成命令。传给 factory 的 endpoint port 为 `0`，表示 worker 应自行选择 loopback 端口。worker 绑定成功后必须向 stdout 输出一行 `LOCAL_RUNTIME_ENDPOINT {"host":"127.0.0.1","port":12345,"path":"/mcp"}`，然后在这个 endpoint 响应 `ping`；manager 只有在握手和 ready 都成功后才写入注册表。stdout 握手之后的内容和 stderr 都会持续消费，避免子进程因输出缓冲阻塞。
 
 ## 生命周期契约
 
 1. endpoint bind 成功并可响应 `ping` 后，才发布 registry record。
 2. registry record 带有随机 `session_id` 和 `lease_id`；旧 owner 不能注销后来复用的记录。
 3. stop 顺序固定为停止 heartbeat、注销 lease、停止 endpoint 或 worker。
-4. worker 的 stdin 与控制面 stdio 脱钩，stderr 必须持续 drain；stdout 不承载诊断日志。
+4. worker 的 stdin 与控制面 stdio 脱钩；stdout 只承载 endpoint 握手，诊断日志写入 stderr，两个管道都必须持续消费。
 5. 路由只允许 loopback endpoint；没有 session id 时仅在恰好一个会话存在时自动选择。
 6. `identity` 与 `metadata` 是 opaque JSON，由具体程序定义；框架不解释路径、二进制或数据库字段。
 

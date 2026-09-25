@@ -49,7 +49,13 @@ def as_json_value(value: object) -> JsonValue:
 
 @dataclass(frozen=True, slots=True)
 class Endpoint:
-    """A local HTTP endpoint exposed by one runtime instance."""
+    """
+    A local HTTP endpoint or an unbound worker endpoint hint.
+
+    Port ``0`` is reserved for the headless launch handshake. It is never a
+    routable endpoint and therefore cannot be persisted in an
+    :class:`InstanceRecord`.
+    """
 
     host: str
     port: int
@@ -60,8 +66,8 @@ class Endpoint:
         if self.host not in {"127.0.0.1", "localhost"}:
             msg = "MCP endpoints must use a loopback host"
             raise TypeError(msg)
-        if not 1 <= self.port <= MAX_PORT:
-            msg = "MCP endpoint port must be between 1 and 65535"
+        if not 0 <= self.port <= MAX_PORT:
+            msg = "MCP endpoint port must be between 0 and 65535"
             raise TypeError(msg)
         if not self.path.startswith("/"):
             msg = "MCP endpoint path must start with '/'"
@@ -70,6 +76,9 @@ class Endpoint:
     @property
     def url(self) -> str:
         """Return the endpoint URL for diagnostics and clients."""
+        if self.port == 0:
+            msg = "an unbound endpoint has no URL"
+            raise ValueError(msg)
         return f"http://{self.host}:{self.port}{self.path}"
 
     def to_json(self) -> JsonObject:
@@ -87,6 +96,7 @@ class Endpoint:
             not isinstance(host, str)
             or not isinstance(port, int)
             or isinstance(port, bool)
+            or port == 0
         ):
             msg = "endpoint host and port have invalid types"
             raise TypeError(msg)
