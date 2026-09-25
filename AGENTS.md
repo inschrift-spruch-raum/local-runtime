@@ -1,55 +1,44 @@
-# Python Project Template Contributor Notes
+# local-runtime Agent Guide
 
-This repository is a copy-first Python project template. Keep the template small, self-contained, and free of product-specific behavior.
+## Mission
 
-## Commands
+Maintain `local-runtime` as a small, product-neutral Python runtime for local endpoint discovery, routing, leases, lifecycle ownership, and GUI/headless adapters. Keep host behavior at adapter boundaries; the library owns generic coordination only.
 
-Run every command from the repository root:
+## Working Rules
 
-~~~bash
-uv sync --group dev
-uv run ruff check .
-uv run ruff format --check .
-uv run basedpyright
-uv run pytest
-~~~
+- Use the globally installed `uv` for Python environments and dependencies.
+- Treat `pyproject.toml` as the source of truth for metadata, dependencies, packaging, and tool configuration.
+- Keep runtime dependencies empty and development tools in the `dev` group.
+- Target Python 3.14 or newer, strict BasedPyright, the `src` layout, and the explicit Hatchling package `src/local_runtime`.
+- Keep public modules typed, cohesive, and documented with Google-style docstrings. Put `from __future__ import annotations` after each module docstring.
+- Put host SDKs, product handlers, installers, file formats, databases, and worker entrypoints in consuming projects.
+- Keep generated environments, build output, caches, credentials, and unrelated lockfile changes out of Git.
 
-Verification order: ruff check -> ruff format --check -> basedpyright -> pytest. Before a release, also run uv build and inspect the wheel contents.
+## Change Loop
 
-## Template architecture
+1. Read `docs/runtime-contract.md` before changing public registry, transport, routing, lifecycle, or adapter behavior.
+2. Locate the owning module and make one cohesive change.
+3. Add a focused contract test for each changed behavior and failure path under `tests/`.
+4. Run this sequence from the repository root:
 
-| Path | Responsibility |
-|---|---|
-| src/python_template/__init__.py | Minimal public package namespace; add product modules here after instantiation. |
-| src/python_template/py.typed | PEP 561 marker for typed consumers. |
-| tests/test_package.py | Import smoke test that must remain fast and dependency-free. |
-| pyproject.toml | Package metadata, Hatchling build, Ruff, BasedPyright, and pytest configuration. |
-| docs/template-contract.md | Identity replacement and extension rules for copied projects. |
+   ```text
+   uv sync --group dev
+   uv run ruff check .
+   uv run ruff format --check .
+   uv run basedpyright
+   uv run pytest
+   ```
 
-The template is intentionally static. Do not add a generator, shell hook, network fetch, or arbitrary template execution unless that becomes an explicit product requirement with its own threat model and tests.
+   On Windows, if `uv` cannot write its environment or cache, rerun the same command with the required elevation. Preserve the project configuration.
 
-## Constraints
+5. Before release, run `uv build`, inspect the sdist and wheel contents, then run `git diff --check`.
+6. Report completion only when the changed behavior, focused tests, verification sequence, and final diff all pass.
 
-- Python 3.14+ is the baseline unless the instantiated project deliberately lowers it in both pyproject.toml and .python-version.
-- Keep the src layout and the explicit extraPaths = ["src"] setting unless the project adopts an equivalent, documented type-checker configuration.
-- Keep runtime dependencies empty until the instantiated product actually needs one. Development tools belong in the dev dependency group.
-- Keep Hatchling's wheel package selection explicit: packages = ["src/<import-package>"].
-- Keep public modules typed under strict BasedPyright; do not suppress diagnostics with broad casts or ignore comments.
-- Use Google-style docstrings and put from __future__ import annotations first in every source module after its docstring.
-- Do not add parent-directory, file:, or link: dependencies to project configuration.
-- Do not commit virtual environments, build output, caches, credentials, or generated lockfile changes unrelated to dependency updates.
+## Repository Map
 
-## Instantiation workflow
+- `src/local_runtime/`: generic registry, transport, routing, lifecycle, and adapter modules.
+- `src/local_runtime/py.typed`: typed-consumer marker.
+- `tests/`: contract tests using `--import-mode=importlib`.
+- `docs/runtime-contract.md`: public lifecycle and adapter contract.
 
-1. Copy the repository into a new project or use it as a repository-template source.
-2. Replace the distribution name and import package name independently.
-3. Update metadata, license, documentation, and CI together.
-4. Add the first real module and a focused test; keep __init__.py as a public boundary.
-5. Run the complete verification order, then build and inspect the artifact.
-
-## Style and ownership
-
-- Keep feature code in cohesive modules instead of growing one catch-all file.
-- Keep tests under tests/ and use --import-mode=importlib to exercise the packaged src layout.
-- Update README, this file, and docs/template-contract.md when the template contract changes.
-- A copied project may remove template-only guidance after its identity and module layout are finalized, but it must retain equivalent contributor and verification documentation.
+Keep distribution name `local-runtime`, import name `local_runtime`, author, repository URL, license, version, and Python requirement synchronized in `pyproject.toml`.

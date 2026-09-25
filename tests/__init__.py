@@ -1,1 +1,1 @@
-"""Test suite for the Python project template."""
+"""Contract tests for local-runtime."""

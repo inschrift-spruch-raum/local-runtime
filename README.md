@@ -1,119 +1,86 @@
-# python-template：Python 项目模板
+# local-runtime
 
-一个可复制的、基于 src/ 布局的 Python 3.14+ 项目模板。它是一个**仓库模板**，不是业务运行时：模板只提供项目边界、打包配置、严格类型检查、测试和 CI 基线，不预设领域实现。
+一个与具体程序无关的 Python 运行时范式，用来同时承载 GUI 宿主和无头 worker 的 MCP/JSON-RPC 操作。
 
-> English summary: this repository is a self-contained, copy-first Python project template. It intentionally contains no product-specific runtime.
+它只提供控制面和生命周期基础设施，不包含任何宿主 SDK、数据库或业务工具代码。具体应用通过适配器注入自己的 handler、宿主线程执行器和 worker 启动命令。
 
-## 适用场景
+## 拓扑
 
-复制本仓库后，可以快速得到一个具备以下基础设施的 Python 包：
+```text
+MCP client / control plane
+          |
+          | session_id + local JSON-RPC
+          v
+    InstanceRegistry
+       /       \
+      /         \
+ GUI endpoint   headless worker endpoint
+```
 
-- src/<package>/ 源码布局，避免未安装源码意外遮蔽已安装包；
-- Hatchling 构建和可发布的 wheel/sdist；
-- Python 3.14+、严格 BasedPyright 类型检查；
-- Ruff 全规则 lint 与格式检查；
-- pytest 测试入口和 importlib 隔离导入模式；
-- py.typed 标记，默认面向类型化库；
-- 可直接复制并修改的 GitHub Actions CI。
+GUI 和 headless 共享 `Endpoint`、注册表、lease heartbeat、路由器和工具目录。每个会话只拥有一个 loopback endpoint；同一会话内部的线程串行化和宿主主线程约束通过适配器的 `execution_gate` 注入。
 
-## 仓库布局
+## 公共模块
 
-~~~text
-.
-├── .github/workflows/ci.yml  # 冻结依赖、lint、类型检查、测试和构建
-├── src/
-│   ├── README.md              # 源码扩展约定
-│   └── python_template/       # 示例 Python 导入包名
-│       ├── __init__.py
-│       └── py.typed
-├── tests/
-│   ├── README.md              # 测试扩展约定
-│   └── test_package.py        # 最小导入烟雾测试
-├── docs/template-contract.md  # 模板契约和身份替换清单
-├── AGENTS.md                  # 仓库本地开发规则
-├── LICENSE
-├── README.md
-├── pyproject.toml
-└── .python-version
-~~~
+| 模块 | 责任 |
+| --- | --- |
+| `types.py` | `Endpoint`、`Registration`、`InstanceRecord`、JSON 类型和运行模式 |
+| `registry.py` | 原子 JSON 注册表、跨进程锁、opaque session id、lease、过期记录 |
+| `transport.py` | loopback JSON-RPC client/server；body 限制和异常脱敏 |
+| `router.py` | 单会话自动选择、多会话显式选择、身份校验 seam、转发 |
+| `catalog.py` | 工具 schema 的原子快照和重复名称检查 |
+| `gui.py` | GUI 宿主的通用 endpoint adapter，不依赖 GUI SDK |
+| `headless.py` | 子进程启动、ready ping、stderr drain、优雅停止和强制回收 |
+| `runtime.py` | 注册、heartbeat、注销和 adapter 的逆序清理 |
+| `server.py` | 控制面管理方法和远程工具调用入口 |
 
-根目录就是可复制的模板实例；不需要先安装模板引擎，也不会执行复制过程中的脚本。
+## 最小接入示例
 
-## 创建新项目
+```python
+from local_runtime import GuiAdapter, InstanceRegistry, InstanceRouter, MultiModeRuntime
 
-### 方式一：复制仓库
+registry = InstanceRegistry()
+gui = GuiAdapter(
+    dispatcher,
+    execution_gate=host_main_thread.run,
+    label="interactive-host",
+    capabilities=("tools",),
+)
+runtime = MultiModeRuntime(registry, gui)
+record = runtime.start()
 
-~~~bash
-cp -a python-template my-project
-cd my-project
-rm -rf .git
-git init
-~~~
+router = InstanceRouter(registry)
+result = router.route("example/tool", {"session_id": record.session_id, "value": 1})
 
-也可以使用 GitHub 的 **Use this template**，或将本目录复制到一个新的空仓库。复制后按下面的清单替换身份。
+runtime.stop()
+```
 
-### 方式二：保留模板作为基线
+`dispatcher(method, params)`、`execution_gate(call)`、worker command factory 和工具目录是具体程序注入的 seams。框架不会导入或命名具体工具，也不会猜测宿主的线程模型。
 
-如果要在同一仓库维护多个包，不要把模板目录直接当作产品包发布；将它复制到独立的包目录，并让每个实例拥有自己的 pyproject.toml、src/<package>/ 和 tests/。
+无头模式使用 `HeadlessSessionManager`，通过 `WorkerCommandFactory(input_ref, endpoint)` 生成命令。worker 必须在准备好同一 JSON-RPC endpoint 后响应 `ping`；manager 只有在 ready 后才写入注册表。
 
-## 实例化清单
+## 生命周期契约
 
-在第一次提交前，至少更新这些位置：
+1. endpoint bind 成功并可响应 `ping` 后，才发布 registry record。
+2. registry record 带有随机 `session_id` 和 `lease_id`；旧 owner 不能注销后来复用的记录。
+3. stop 顺序固定为停止 heartbeat、注销 lease、停止 endpoint 或 worker。
+4. worker 的 stdin 与控制面 stdio 脱钩，stderr 必须持续 drain；stdout 不承载诊断日志。
+5. 路由只允许 loopback endpoint；没有 session id 时仅在恰好一个会话存在时自动选择。
+6. `identity` 与 `metadata` 是 opaque JSON，由具体程序定义；框架不解释路径、二进制或数据库字段。
 
-1. pyproject.toml 的 project.name、version、description、作者和许可证信息；
-2. src/python_template/ 目录名以及所有导入语句，将其改成合法的 Python 导入名；
-3. README.md、AGENTS.md、src/README.md 和 tests/README.md 中的项目身份；
-4. .python-version 与 pyproject.toml 中的 Python 最低版本（如果项目需要不同版本）；
-5. CI 中的发布、权限和项目特定步骤；
-6. LICENSE 中的版权主体。
+## Transport scope
 
-发行名可以包含连字符（例如 python-template），但导入包名必须是 Python 标识符（例如 python_template）。本模板因此使用发行名 python-template 和导入名 python_template；不要把二者混为一谈。
-
-## src 与 extraPaths
-
-Python 运行时不会因为目录叫 src 就自动把它加入 sys.path；开发时应通过 editable install 或构建后的包导入。模板在 [tool.pyright] 中显式保留：
-
-~~~toml
-extraPaths = ["src"]
-~~~
-
-这是给 Pyright/BasedPyright 的静态导入解析路径，不会改变 Python 运行时。现代 Pyright 通常也会对根目录下的 src 做回退探测，但显式配置能让编辑器、旧版本工具和 CI 获得一致结果。
+`LocalMcpServer` 提供单请求 HTTP JSON-RPC 2.0 substrate：支持对象参数、响应大小限制和 notification，不实现 stdio、批处理或 MCP initialize 握手。消费项目可把 `ControlPlane.dispatch` 接到自己的 stdio/MCP 外层。
 
 ## 开发
 
-在仓库根目录执行：
+使用 `uv` 管理 Python 运行时和依赖：
 
-~~~bash
+```bash
 uv sync --group dev
 uv run ruff check .
 uv run ruff format --check .
 uv run basedpyright
 uv run pytest
-~~~
+```
 
-推荐的验证顺序是 ruff check -> ruff format --check -> basedpyright -> pytest。
-
-构建并检查发行包：
-
-~~~bash
-uv build
-unzip -l dist/*.whl
-~~~
-
-wheel 应包含 python_template/__init__.py 和 python_template/py.typed，而不应把仓库根目录的测试或缓存带入运行时包。
-
-## 模板原则
-
-- **复制优先**：模板是静态、自包含的仓库，不依赖远程路径或执行钩子。
-- **最小公共面**：示例包只有包标记，不伪造业务 API；实例化者按领域添加模块。
-- **显式边界**：源码、测试、构建和文档路径都从当前仓库根解析。
-- **可替换身份**：项目发行名、导入名、作者和版本都集中在实例化清单中。
-- **默认安全**：不在安装或构建阶段运行任意脚本，不携带本地路径依赖。
-
-## 从旧版本升级
-
-当前仓库已从一个特定领域的运行时重置为通用项目模板。旧版本的领域 API 不再是模板公共契约；需要继续使用旧产品的项目应固定旧版本或迁移实现，不要把模板包当作兼容层。
-
-## License
-
-MIT，详见 [LICENSE](LICENSE)。
+验证顺序是 `ruff check` -> `ruff format --check` -> `basedpyright` -> `pytest`。发布前运行 `uv build` 并检查 wheel 内容。
