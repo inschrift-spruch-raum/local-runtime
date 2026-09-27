@@ -2,7 +2,7 @@
 
 一个与具体程序无关的 Python 运行时范式，用来同时承载 GUI 宿主和无头 worker 的 MCP/JSON-RPC 操作。
 
-它只提供控制面和生命周期基础设施，不包含任何宿主 SDK、数据库或业务工具代码。具体应用通过适配器注入自己的 handler、宿主线程执行器和 worker 启动命令。
+它只提供控制面和生命周期基础设施，不包含任何宿主 SDK、数据库或业务工具代码。具体应用通过适配器注入自己的 handler、宿主线程执行器和 worker 进程启动器。
 
 ## 拓扑
 
@@ -23,27 +23,32 @@ GUI 和 headless 共享 `Endpoint`、注册表、lease heartbeat、路由器和�
 
 | 模块 | 责任 |
 | --- | --- |
-| `types.py` | `Endpoint`、`Registration`、`InstanceRecord`、JSON 类型和运行模式 |
+| `types.py` | `Endpoint`、`RegistrationDetails`、`Registration`、`InstanceRecord`、JSON 类型和运行模式 |
 | `registry.py` | 原子 JSON 注册表、跨进程锁、opaque session id、lease、过期记录 |
 | `transport.py` | loopback JSON-RPC client/server；body 限制和异常脱敏 |
 | `router.py` | 单会话自动选择、多会话显式选择、身份校验 seam、转发 |
 | `catalog.py` | 工具 schema 的原子快照和重复名称检查 |
 | `gui.py` | GUI 宿主的通用 endpoint adapter，不依赖 GUI SDK |
-| `headless.py` | 子进程启动、ready ping、stderr drain、优雅停止和强制回收 |
+| `headless.py` | worker 握手、ready ping、stderr drain、优雅停止和强制回收 |
 | `runtime.py` | 注册、heartbeat、注销和 adapter 的逆序清理 |
 | `server.py` | 控制面管理方法和远程工具调用入口 |
 
 ## 最小接入示例
 
 ```python
-from local_runtime import GuiAdapter, InstanceRegistry, InstanceRouter, MultiModeRuntime
+from local_runtime import (
+    GuiAdapter,
+    InstanceRegistry,
+    InstanceRouter,
+    MultiModeRuntime,
+    RegistrationDetails,
+)
 
 registry = InstanceRegistry()
 gui = GuiAdapter(
     dispatcher,
     execution_gate=host_main_thread.run,
-    label="interactive-host",
-    capabilities=("tools",),
+    details=RegistrationDetails(label="interactive-host", capabilities=("tools",)),
 )
 runtime = MultiModeRuntime(registry, gui)
 record = runtime.start()
@@ -54,9 +59,37 @@ result = router.route("example/tool", {"session_id": record.session_id, "value":
 runtime.stop()
 ```
 
-`dispatcher(method, params)`、`execution_gate(call)`、worker command factory 和工具目录是具体程序注入的 seams。框架不会导入或命名具体工具，也不会猜测宿主的线程模型。
+`dispatcher(method, params)`、`execution_gate(call)`、worker launcher 和工具目录是具体程序注入的 seams。框架不会导入或命名具体工具，也不会猜测宿主的线程模型。
 
-无头模式使用 `HeadlessSessionManager`，通过 `WorkerCommandFactory(input_ref, endpoint)` 生成命令。传给 factory 的 endpoint port 为 `0`，表示 worker 应自行选择 loopback 端口。worker 绑定成功后必须向 stdout 输出一行 `LOCAL_RUNTIME_ENDPOINT {"host":"127.0.0.1","port":12345,"path":"/mcp"}`，然后在这个 endpoint 响应 `ping`；manager 只有在握手和 ready 都成功后才写入注册表。stdout 握手之后的内容和 stderr 都会持续消费，避免子进程因输出缓冲阻塞。
+GUI 构造和 headless `open()` 都用 `RegistrationDetails` 传入会话标签、能力、opaque identity 和 metadata；未传入时分别使用 `gui` 和 `headless` 标签。`JsonRpcClient.request()` 的超时、request id 和响应大小上限由 `JsonRpcRequestOptions` 统一传入。
+
+无头模式使用 `HeadlessSessionManager`，通过 `WorkerLauncher(input_ref, endpoint_hint)` 由宿主 adapter 启动并返回 `subprocess.Popen[bytes]`。adapter 应使用可信的可执行文件、argv 列表和 `shell=False`，并设置 `stdin=DEVNULL`、`stdout=PIPE`、`stderr=PIPE`。传给 launcher 的 endpoint port 为 `0`，表示 worker 应自行选择 loopback 端口。worker 绑定成功后必须向 stdout 输出一行 `LOCAL_RUNTIME_ENDPOINT {"host":"127.0.0.1","port":12345,"path":"/mcp"}`，然后在这个 endpoint 响应 `ping`；manager 只有在握手和 ready 都成功后才写入注册表。stdout 握手之后的内容和 stderr 都会持续消费，避免子进程因输出缓冲阻塞。
+
+例如，消费项目可以固定自己的 worker 模块，只把 `input_ref` 作为独立参数传入：
+
+```python
+import subprocess
+import sys
+
+from local_runtime import Endpoint
+
+
+def launch_worker(input_ref: str, endpoint_hint: Endpoint) -> subprocess.Popen[bytes]:
+    assert endpoint_hint.port == 0
+    creationflags = (
+        subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        if sys.platform == "win32"
+        else 0
+    )
+    return subprocess.Popen(
+        [sys.executable, "-m", "my_product.worker", input_ref],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        creationflags=creationflags,
+    )
+```
 
 ## 生命周期契约
 

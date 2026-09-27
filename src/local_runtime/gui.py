@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from .errors import LifecycleError
-from .transport import JsonRpcClient, LocalMcpServer
-from .types import JsonObject, JsonValue, Registration
+from .transport import JsonRpcClient, JsonRpcRequestOptions, LocalMcpServer
+from .types import JsonObject, JsonValue, Registration, RegistrationDetails
 
 ExecutionGate = Callable[[Callable[[], JsonValue]], JsonValue]
 
@@ -14,32 +14,38 @@ ExecutionGate = Callable[[Callable[[], JsonValue]], JsonValue]
 class GuiAdapter:
     """Adapt an interactive host's main-thread callbacks to the shared runtime."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         handler: Callable[[str, JsonObject], JsonValue],
         *,
-        label: str = "gui",
-        capabilities: tuple[str, ...] = (),
-        metadata: JsonObject | None = None,
-        identity: JsonObject | None = None,
+        details: RegistrationDetails | None = None,
         pid: int | None = None,
         execution_gate: ExecutionGate | None = None,
     ) -> None:
-        """Create an adapter with an explicit host-thread execution seam."""
+        """
+        Create an adapter with an explicit host-thread execution seam.
+
+        Args:
+            handler: Process one JSON-RPC method and its object parameters.
+            details: Session data to publish after readiness; defaults to a
+                GUI label when omitted.
+            pid: Optional host process ID for the registry.
+            execution_gate: Marshal handler calls onto the host's main thread.
+
+        """
         self._server = LocalMcpServer(
             _json_handler(handler, execution_gate or _direct_execution)
         )
-        self._label = label
-        self._capabilities = capabilities
-        self._metadata = metadata or {}
-        self._identity = identity
+        self._details = details or RegistrationDetails(label="gui")
         self._pid = pid
 
     def start(self) -> Registration:
         """Start the loopback endpoint and return generic registration data."""
         endpoint = self._server.start(background=True)
         try:
-            JsonRpcClient().request(endpoint, "ping", timeout=2.0)
+            JsonRpcClient().request(
+                endpoint, "ping", options=JsonRpcRequestOptions(timeout=2.0)
+            )
         except (ConnectionError, RuntimeError, ValueError, OSError) as exc:
             self._server.stop()
             msg = "GUI endpoint did not become ready"
@@ -47,10 +53,10 @@ class GuiAdapter:
         return Registration(
             mode="gui",
             endpoint=endpoint,
-            label=self._label,
-            capabilities=self._capabilities,
-            metadata=self._metadata,
-            identity=self._identity,
+            label=self._details.label,
+            capabilities=self._details.capabilities,
+            metadata=self._details.metadata,
+            identity=self._details.identity,
             pid=self._pid,
         )
 

@@ -106,6 +106,16 @@ class Endpoint:
         return cls(host, port, path)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RegistrationDetails:
+    """Adapter supplied label, capabilities, and opaque session data."""
+
+    label: str
+    capabilities: tuple[str, ...] = ()
+    identity: JsonObject | None = None
+    metadata: JsonObject = field(default_factory=dict)
+
+
 @dataclass(frozen=True, slots=True)
 class Registration:
     """Data supplied by a GUI or headless adapter when it becomes ready."""

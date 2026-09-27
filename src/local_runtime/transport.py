@@ -2,69 +2,99 @@
 
 from __future__ import annotations
 
+import http.client
 import json
+import logging
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 from .errors import MultiMcpError
 from .types import Endpoint, JsonObject, JsonValue, as_json_object
 
 JsonRpcHandler = Callable[[str, JsonObject], JsonValue]
+_logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class JsonRpcRequestOptions:
+    """Timeout, request ID, and response limit for one client call."""
+
+    timeout: float = 30.0
+    request_id: int | str = 1
+    max_response_bytes: int = 10 * 1024 * 1024
 
 
 class JsonRpcClient:
     """Send one JSON-RPC request to a loopback endpoint."""
 
-    def request(  # noqa: PLR0913
+    def request(
         self,
         endpoint: Endpoint,
         method: str,
         params: JsonObject | None = None,
         *,
-        timeout: float = 30.0,
-        request_id: int | str = 1,
-        max_response_bytes: int = 10 * 1024 * 1024,
+        options: JsonRpcRequestOptions | None = None,
     ) -> JsonValue:
-        """Send a request and return its result, raising on protocol errors."""
+        """
+        Send a request and return its result, raising on protocol errors.
+
+        Args:
+            endpoint: Bound loopback endpoint to contact.
+            method: Nonempty JSON-RPC method name.
+            params: Object parameters, or an empty object when omitted.
+            options: Per-request timeout, ID, and response size limit.
+
+        Returns:
+            The JSON-RPC result value.
+
+        """
+        options = options or JsonRpcRequestOptions()
         if not method:
             msg = "JSON-RPC method must not be empty"
             raise ValueError(msg)
-        if isinstance(request_id, bool):
+        if isinstance(options.request_id, bool):
             msg = "JSON-RPC request id must be a string or number"
             raise TypeError(msg)
         payload: JsonObject = {
             "jsonrpc": "2.0",
-            "id": request_id,
+            "id": options.request_id,
             "method": method,
             "params": params or {},
         }
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        request = Request(  # noqa: S310
-            endpoint.url, data=body, headers={"Content-Type": "application/json"}
+        connection = http.client.HTTPConnection(
+            endpoint.host, endpoint.port, options.timeout
         )
         try:
-            with urlopen(request, timeout=timeout) as response:  # noqa: S310
-                raw = response.read(max_response_bytes + 1)
-        except (OSError, URLError) as exc:
+            connection.request(
+                "POST",
+                endpoint.path,
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            raw = response.read(options.max_response_bytes + 1)
+        except OSError as exc:
             msg = "local MCP endpoint is unavailable"
             raise ConnectionError(msg) from exc
+        finally:
+            connection.close()
+        if len(raw) > options.max_response_bytes:
+            msg = "local MCP endpoint response is too large"
+            raise ValueError(msg)
         try:
             decoded = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             msg = "local MCP endpoint returned invalid JSON"
             raise ValueError(msg) from exc
-        if len(raw) > max_response_bytes:
-            msg = "local MCP endpoint response is too large"
-            raise ValueError(msg)
         decoded = as_json_object(decoded)
         if decoded.get("jsonrpc") != "2.0":
             msg = "local MCP endpoint returned an invalid JSON-RPC version"
             raise ValueError(msg)
-        if decoded.get("id") != request_id:
+        if decoded.get("id") != options.request_id:
             msg = "local MCP endpoint returned a mismatched request id"
             raise ValueError(msg)
         if "error" in decoded:
@@ -141,62 +171,51 @@ class LocalMcpServer:
         if thread is not None:
             thread.join(timeout=5)
 
-    def _handler_factory(self) -> type[BaseHTTPRequestHandler]:  # noqa: C901
+    def _handle_post(self, handler: BaseHTTPRequestHandler) -> None:
+        if handler.path != "/mcp":
+            handler.send_error(404)
+            return
+        if not handler.headers.get("Content-Type", "").startswith("application/json"):
+            handler.send_error(415)
+            return
+        length = _content_length(handler)
+        if length is None:
+            handler.send_error(400)
+            return
+        if length < 0 or length > self.max_body_bytes:
+            handler.send_error(413)
+            return
+        request = _decode_request(handler.rfile.read(length))
+        response = self._dispatch(request)
+        _send_response(handler, response)
+
+    def _dispatch(self, request: JsonObject) -> JsonObject | None:
+        try:
+            method, params = _request_parts(request)
+            result = self.handler(method, params)
+            if "id" not in request:
+                return None
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
+        except MultiMcpError as exc:
+            return _error_response(request, -32000, str(exc))
+        except (TypeError, ValueError) as exc:
+            return _error_response(request, -32602, str(exc))
+        except Exception as exc:
+            _logger.exception("Unexpected JSON-RPC handler failure")
+            return _error_response(request, -32603, type(exc).__name__)
+
+    def _handler_factory(self) -> type[BaseHTTPRequestHandler]:
         server = self
 
         class Handler(BaseHTTPRequestHandler):
             """Bound request handler with no product-specific routes."""
 
             def do_POST(self) -> None:
-                if self.path != "/mcp":
-                    self.send_error(404)
-                    return
-                content_type = self.headers.get("Content-Type", "")
-                if not content_type.startswith("application/json"):
-                    self.send_error(415)
-                    return
-                try:
-                    length = int(self.headers.get("Content-Length", "-1"))
-                except ValueError:
-                    self.send_error(400)
-                    return
-                if length < 0 or length > server.max_body_bytes:
-                    self.send_error(413)
-                    return
-                request: JsonObject = {}
-                response: JsonObject | None = None
-                try:
-                    request = as_json_object(
-                        json.loads(self.rfile.read(length).decode("utf-8"))
-                    )
-                    method, params = _request_parts(request)
-                    result = server.handler(method, params)
-                    if "id" in request:
-                        response = {
-                            "jsonrpc": "2.0",
-                            "id": request["id"],
-                            "result": result,
-                        }
-                except MultiMcpError as exc:
-                    response = _error_response(request, -32000, str(exc))
-                except (TypeError, ValueError) as exc:
-                    response = _error_response(request, -32602, str(exc))
-                except Exception as exc:  # noqa: BLE001
-                    response = _error_response(request, -32603, type(exc).__name__)
-                if response is None:
-                    self.send_response(204)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                body = json.dumps(response, separators=(",", ":")).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                server._handle_post(self)
 
-            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-                del format, args
+            def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+                """Keep normal JSON-RPC requests out of stderr."""
+                del code, size
 
         return Handler
 
@@ -209,6 +228,39 @@ def _safe_error(value: object) -> str:
         )
         return str(message)[:500]
     return "remote JSON-RPC error"
+
+
+def _content_length(handler: BaseHTTPRequestHandler) -> int | None:
+    """Read a request length, returning ``None`` for malformed headers."""
+    try:
+        return int(handler.headers.get("Content-Length", "-1"))
+    except ValueError:
+        return None
+
+
+def _decode_request(raw: bytes) -> JsonObject:
+    """Decode one request body, using an empty object for malformed JSON."""
+    try:
+        return as_json_object(json.loads(raw.decode("utf-8")))
+    except UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError:
+        return {}
+
+
+def _send_response(
+    handler: BaseHTTPRequestHandler, response: JsonObject | None
+) -> None:
+    """Write a JSON-RPC response or an empty notification response."""
+    if response is None:
+        handler.send_response(204)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return
+    body = json.dumps(response, separators=(",", ":")).encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
 
 
 def _error_response(request: JsonObject, code: int, message: str) -> JsonObject | None:

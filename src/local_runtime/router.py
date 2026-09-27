@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 from .errors import RoutingError
-from .transport import JsonRpcClient
+from .transport import JsonRpcClient, JsonRpcRequestOptions
 
 if TYPE_CHECKING:
     from .registry import InstanceRegistry
@@ -51,7 +51,12 @@ class InstanceRouter:
         if self.verifier is not None and not self.verifier(record):
             msg = "session identity could not be verified"
             raise RoutingError(msg)
-        return self.client.request(record.endpoint, method, arguments, timeout=timeout)
+        return self.client.request(
+            record.endpoint,
+            method,
+            arguments,
+            options=JsonRpcRequestOptions(timeout=timeout),
+        )
 
     def _select(self, requested: str | None) -> InstanceRecord:
         if requested:

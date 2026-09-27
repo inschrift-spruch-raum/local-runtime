@@ -9,17 +9,21 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from local_runtime import HeadlessSessionManager, InstanceRegistry, MultiModeRuntime
-from local_runtime.errors import LifecycleError
-from local_runtime.headless import (
-    _parse_endpoint_handshake,  # pyright: ignore[reportPrivateUsage]
+from local_runtime import (
+    ControlPlane,
+    HeadlessSessionManager,
+    InstanceRegistry,
+    InstanceRouter,
+    MultiModeRuntime,
+    RegistrationDetails,
+    WorkerLauncher,
 )
+from local_runtime.errors import LifecycleError
 from local_runtime.types import Endpoint, InstanceRecord, Registration
 
 if TYPE_CHECKING:
-    import subprocess
-    from collections.abc import Sequence
     from pathlib import Path
+    from subprocess import Popen
 
 
 def _record(*, session_id: str = "session") -> InstanceRecord:
@@ -114,6 +118,15 @@ class _HeadlessHeartbeatRegistry:
 
     def __init__(self) -> None:
         self.expire_calls: list[tuple[str, str, str | None]] = []
+        self.record = _record()
+
+    def register(self, registration: Registration) -> InstanceRecord:
+        del registration
+        return self.record
+
+    def unregister(self, session_id: str, lease_id: str | None = None) -> bool:
+        del session_id, lease_id
+        return True
 
     def heartbeat(self, session_id: str, lease_id: str) -> bool:
         del session_id, lease_id
@@ -124,28 +137,21 @@ class _HeadlessHeartbeatRegistry:
         return True
 
 
-class _OneShotStop:
-    """Stop event double that lets the heartbeat loop execute once."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def wait(self, timeout: float) -> bool:
-        del timeout
-        self.calls += 1
-        return self.calls > 1
-
-
 class _Process:
     """Small process double for the registration race test."""
 
     pid = 123
 
-    def __init__(self) -> None:
-        self.stdout = io.BytesIO(
-            b'LOCAL_RUNTIME_ENDPOINT {"host":"127.0.0.1","port":43210,"path":"/mcp"}\n'
+    def __init__(self, *, stdout_pipe: bool = True, stderr_pipe: bool = True) -> None:
+        self.stdout: io.BytesIO | None = (
+            io.BytesIO(
+                b"LOCAL_RUNTIME_ENDPOINT "
+                b'{"host":"127.0.0.1","port":43210,"path":"/mcp"}\n'
+            )
+            if stdout_pipe
+            else None
         )
-        self.stderr = io.BytesIO()
+        self.stderr: io.BytesIO | None = io.BytesIO() if stderr_pipe else None
         self.terminated = False
 
     def poll(self) -> int | None:
@@ -162,23 +168,20 @@ class _Process:
         return None
 
 
-def _patch_headless_start(monkeypatch: pytest.MonkeyPatch, process: _Process) -> None:
-    """Patch process startup and readiness for a deterministic race test."""
+def _worker_launcher(process: _Process) -> WorkerLauncher:
+    """Return a worker process double through the host adapter seam."""
 
-    def fake_popen(*_args: object, **_kwargs: object) -> _Process:
-        return process
+    def launch(input_ref: str, endpoint: Endpoint) -> Popen[bytes]:
+        del input_ref
+        assert endpoint.port == 0
+        return cast("Popen[bytes]", process)
 
-    def fake_wait_ready(*_args: object, **_kwargs: object) -> bool:
-        return True
-
-    monkeypatch.setattr("local_runtime.headless.subprocess.Popen", fake_popen)
-    monkeypatch.setattr("local_runtime.headless._wait_ready", fake_wait_ready)
+    return launch
 
 
-def _command_factory(input_ref: str, endpoint: Endpoint) -> Sequence[str]:
-    """Build a minimal worker command for manager tests."""
-    assert endpoint.port == 0
-    return ("worker", input_ref, str(endpoint.port))
+def _ready(*_args: object) -> bool:
+    """Report readiness for the isolated headless lifecycle test."""
+    return True
 
 
 def test_registry_rejects_unresolved_worker_endpoint(tmp_path: Path) -> None:
@@ -226,49 +229,134 @@ def test_lease_loss_expires_history_before_stopping_adapter() -> None:
     assert runtime.record is None
 
 
-def test_endpoint_handshake_returns_the_worker_bound_endpoint() -> None:
-    """The startup handshake parses a real endpoint instead of a guessed port."""
-    line = b'LOCAL_RUNTIME_ENDPOINT {"host":"127.0.0.1","port":43210,"path":"/mcp"}\n'
-    assert _parse_endpoint_handshake(line) == Endpoint("127.0.0.1", 43210)
-    assert _parse_endpoint_handshake(b"worker log\n") is None
-
-
 def test_headless_lease_loss_expires_history_and_reaps_worker() -> None:
     """A headless lease loss expires the record before killing its worker."""
     registry = _HeadlessHeartbeatRegistry()
-    manager = HeadlessSessionManager(
-        cast("InstanceRegistry", registry), _command_factory
-    )
-    manager.close_all()
     process = _Process()
-    with manager._lock:  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        manager._processes["session"] = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage, reportArgumentType]
-            cast("subprocess.Popen[bytes]", process),
-            "lease",
-        )
-    manager._heartbeat_stop = cast(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        "threading.Event", _OneShotStop()
+    manager = HeadlessSessionManager(
+        cast("InstanceRegistry", registry),
+        _worker_launcher(process),
+        readiness_probe=_ready,
+        heartbeat_interval=0.001,
     )
-
-    manager._heartbeat_loop()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-    manager._heartbeat_stop = threading.Event()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    manager.open("input")
+    for _ in range(1000):
+        if process.terminated:
+            break
+        threading.Event().wait(0.001)
+    manager.close_all()
 
     assert registry.expire_calls == [("session", "lease_lost", "lease")]
     assert process.terminated
 
 
-def test_headless_close_all_cannot_miss_registration(
-    monkeypatch: pytest.MonkeyPatch,
+def test_headless_launcher_receives_input_and_endpoint_hint(tmp_path: Path) -> None:
+    """Pass the opaque input reference and port-zero hint to the adapter."""
+    launched: list[tuple[str, Endpoint]] = []
+    process = _Process()
+
+    def launch(input_ref: str, endpoint: Endpoint) -> Popen[bytes]:
+        launched.append((input_ref, endpoint))
+        return cast("Popen[bytes]", process)
+
+    manager = HeadlessSessionManager(
+        InstanceRegistry(tmp_path / "sessions.json"),
+        launch,
+        readiness_probe=_ready,
+    )
+    input_ref = "input with spaces; $(echo injected)"
+    try:
+        record = manager.open(input_ref)
+        assert launched == [(input_ref, Endpoint("127.0.0.1", 0))]
+        assert record.label == "headless"
+    finally:
+        manager.close_all()
+
+
+def test_headless_open_publishes_registration_details(tmp_path: Path) -> None:
+    """Use adapter supplied registration details for a ready worker."""
+    registry = InstanceRegistry(tmp_path / "sessions.json")
+    manager = HeadlessSessionManager(
+        registry, _worker_launcher(_Process()), readiness_probe=_ready
+    )
+    details = RegistrationDetails(
+        label="batch",
+        capabilities=("analyze",),
+        identity={"owner": "host"},
+        metadata={"source": "adapter"},
+    )
+    try:
+        record = manager.open("input", details=details)
+        assert record.label == details.label
+        assert record.capabilities == details.capabilities
+        assert record.identity == details.identity
+        assert record.metadata == {"input_ref": "input", **details.metadata}
+    finally:
+        manager.close_all()
+
+
+def test_control_plane_open_forwards_session_label(tmp_path: Path) -> None:
+    """Keep the control-plane label when opening a headless session."""
+    registry = InstanceRegistry(tmp_path / "sessions.json")
+    manager = HeadlessSessionManager(
+        registry, _worker_launcher(_Process()), readiness_probe=_ready
+    )
+    control = ControlPlane(registry, InstanceRouter(registry), headless=manager)
+    try:
+        result = control.dispatch(
+            "sessions/open", {"input_ref": "input", "label": "from-control"}
+        )
+        assert isinstance(result, dict)
+        assert result["label"] == "from-control"
+    finally:
+        manager.close_all()
+
+
+@pytest.mark.parametrize(("stdout_pipe", "stderr_pipe"), [(False, True), (True, False)])
+def test_headless_launcher_requires_output_pipes(
+    tmp_path: Path, *, stdout_pipe: bool, stderr_pipe: bool
 ) -> None:
+    """Reject and reap a worker that cannot be supervised through pipes."""
+    registry = InstanceRegistry(tmp_path / "sessions.json")
+    process = _Process(stdout_pipe=stdout_pipe, stderr_pipe=stderr_pipe)
+    manager = HeadlessSessionManager(registry, _worker_launcher(process))
+    try:
+        with pytest.raises(LifecycleError, match="pipe stdout and stderr"):
+            manager.open("input")
+        assert process.terminated
+        assert registry.list() == {}
+    finally:
+        manager.close_all()
+
+
+def test_headless_launcher_failure_does_not_register(tmp_path: Path) -> None:
+    """Translate a host startup failure without publishing a session."""
+    registry = InstanceRegistry(tmp_path / "sessions.json")
+
+    def failed_launch(input_ref: str, endpoint: Endpoint) -> Popen[bytes]:
+        del input_ref, endpoint
+        msg = "worker executable missing"
+        raise OSError(msg)
+
+    manager = HeadlessSessionManager(registry, failed_launch)
+    try:
+        with pytest.raises(LifecycleError, match="could not be started"):
+            manager.open("input")
+        assert registry.list() == {}
+    finally:
+        manager.close_all()
+
+
+def test_headless_close_all_cannot_miss_registration() -> None:
     """Closing during registry publication still reaps the newly owned worker."""
     record = _record()
     process = _Process()
     registry = _BlockingRegistry(record)
-    _patch_headless_start(monkeypatch, process)
 
     manager = HeadlessSessionManager(
         cast("InstanceRegistry", registry),
-        _command_factory,
+        _worker_launcher(process),
+        readiness_probe=_ready,
     )
     opened: list[InstanceRecord] = []
     open_error: list[LifecycleError] = []
@@ -298,12 +386,8 @@ def test_headless_close_all_cannot_miss_registration(
 
 def test_headless_open_rejects_manager_after_close() -> None:
     """A manager that has begun shutdown cannot create an orphan worker."""
-
-    def command_factory(input_ref: str, endpoint: Endpoint) -> Sequence[str]:
-        return ("worker", input_ref, str(endpoint.port))
-
     manager = HeadlessSessionManager(
-        cast("InstanceRegistry", object()), command_factory
+        cast("InstanceRegistry", object()), _worker_launcher(_Process())
     )
     manager.close_all()
 

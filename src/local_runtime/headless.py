@@ -7,21 +7,20 @@ import contextlib
 import json
 import queue
 import subprocess
-import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import TYPE_CHECKING, BinaryIO
 
 from .errors import LifecycleError
-from .transport import JsonRpcClient
-from .types import Endpoint, InstanceRecord, JsonObject, Registration
+from .transport import JsonRpcClient, JsonRpcRequestOptions
+from .types import Endpoint, InstanceRecord, Registration, RegistrationDetails
 
 if TYPE_CHECKING:
     from .registry import InstanceRegistry
 
-WorkerCommandFactory = Callable[[str, Endpoint], Sequence[str]]
+WorkerLauncher = Callable[[str, Endpoint], subprocess.Popen[bytes]]
 ReadinessProbe = Callable[[Endpoint, float], bool]
 _ENDPOINT_HANDSHAKE = "LOCAL_RUNTIME_ENDPOINT "
 
@@ -32,14 +31,29 @@ class HeadlessSessionManager:
     def __init__(
         self,
         registry: InstanceRegistry,
-        command_factory: WorkerCommandFactory,
+        worker_launcher: WorkerLauncher,
         *,
         readiness_probe: ReadinessProbe | None = None,
+        heartbeat_interval: float = 30.0,
     ) -> None:
-        """Create a supervisor that delegates worker construction to a factory."""
+        """
+        Create a supervisor that delegates process startup to an adapter.
+
+        Args:
+            registry: Store for ready worker sessions and their leases.
+            worker_launcher: Start a worker with ``stdin=DEVNULL`` and piped
+                stdout and stderr, using a trusted executable without a shell.
+            readiness_probe: Check whether an announced endpoint is ready.
+            heartbeat_interval: Seconds between lease renewals.
+
+        """
+        if heartbeat_interval <= 0:
+            msg = "heartbeat_interval must be positive"
+            raise ValueError(msg)
         self.registry = registry
-        self.command_factory = command_factory
+        self.worker_launcher = worker_launcher
         self.readiness_probe = readiness_probe or _default_readiness_probe
+        self.heartbeat_interval = heartbeat_interval
         self._processes: dict[str, tuple[subprocess.Popen[bytes], str]] = {}
         self._lock = threading.Lock()
         self._closed = False
@@ -50,40 +64,43 @@ class HeadlessSessionManager:
         self._heartbeat_thread.start()
         atexit.register(self.close_all)
 
-    def open(  # noqa: PLR0913
+    def open(
         self,
         input_ref: str,
         *,
-        label: str = "headless",
-        capabilities: tuple[str, ...] = (),
-        identity: JsonObject | None = None,
-        metadata: JsonObject | None = None,
+        details: RegistrationDetails | None = None,
         timeout: float = 60.0,
     ) -> InstanceRecord:
-        """Spawn, await readiness, then publish one headless session."""
+        """
+        Spawn, await readiness, then publish one headless session.
+
+        Args:
+            input_ref: Opaque input reference passed to the worker launcher.
+            details: Session data to publish; defaults to a headless label.
+            timeout: Maximum seconds for the endpoint handshake and ping.
+
+        Returns:
+            The registered record for the ready worker.
+
+        """
         if timeout <= 0:
             msg = "headless worker timeout must be positive"
             raise LifecycleError(msg)
+        details = details or RegistrationDetails(label="headless")
         with self._lock:
             self._ensure_open()
         endpoint_hint = Endpoint("127.0.0.1", 0)
-        command = list(self.command_factory(input_ref, endpoint_hint))
-        if not command:
-            msg = "worker command factory returned an empty command"
-            raise LifecycleError(msg)
         stderr_chunks: deque[bytes] = deque(maxlen=64)
         stdout_chunks: deque[bytes] = deque(maxlen=64)
         try:
-            process = subprocess.Popen(  # noqa: S603
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=_creation_flags(),
-            )
+            process = self.worker_launcher(input_ref, endpoint_hint)
         except OSError as exc:
             msg = "headless worker could not be started"
             raise LifecycleError(msg) from exc
+        if process.stdout is None or process.stderr is None:
+            _terminate(process)
+            msg = "headless worker launcher must pipe stdout and stderr"
+            raise LifecycleError(msg)
 
         drain = threading.Thread(
             target=_drain_stderr, args=(process, stderr_chunks), daemon=True
@@ -103,10 +120,10 @@ class HeadlessSessionManager:
         ):
             _terminate(process)
             drain.join(timeout=1)
-            details = b"".join((*stderr_chunks, *stdout_chunks)).decode(
+            diagnostics = b"".join((*stderr_chunks, *stdout_chunks)).decode(
                 errors="replace"
             )[-500:]
-            msg = f"headless worker did not become ready: {details}"
+            msg = f"headless worker did not become ready: {diagnostics}"
             raise LifecycleError(msg)
 
         record: InstanceRecord | None = None
@@ -118,10 +135,10 @@ class HeadlessSessionManager:
                         mode="headless",
                         endpoint=endpoint,
                         pid=process.pid,
-                        label=label,
-                        capabilities=capabilities,
-                        identity=identity,
-                        metadata={"input_ref": input_ref, **(metadata or {})},
+                        label=details.label,
+                        capabilities=details.capabilities,
+                        identity=details.identity,
+                        metadata={"input_ref": input_ref, **details.metadata},
                     )
                 )
                 self._processes[record.session_id] = (process, record.lease_id)
@@ -155,7 +172,7 @@ class HeadlessSessionManager:
 
     def _heartbeat_loop(self) -> None:
         """Renew every owned lease while the manager remains alive."""
-        while not self._heartbeat_stop.wait(30.0):
+        while not self._heartbeat_stop.wait(self.heartbeat_interval):
             with self._lock:
                 leases = tuple(self._processes.items())
             for session_id, (_process, lease_id) in leases:
@@ -238,7 +255,9 @@ def _consume_stdout(
 def _default_readiness_probe(endpoint: Endpoint, timeout: float) -> bool:
     """Use the protocol ping method as the generic readiness handshake."""
     try:
-        JsonRpcClient().request(endpoint, "ping", timeout=timeout)
+        JsonRpcClient().request(
+            endpoint, "ping", options=JsonRpcRequestOptions(timeout=timeout)
+        )
     except ConnectionError, RuntimeError, ValueError, OSError:
         return False
     return True
@@ -271,13 +290,6 @@ def _drain_stderr(process: subprocess.Popen[bytes], chunks: deque[bytes]) -> Non
             chunks.append(chunk)
     except OSError:
         return
-
-
-def _creation_flags() -> int:
-    """Create a detached process group on Windows when available."""
-    if sys.platform == "win32":
-        return subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    return 0
 
 
 def _terminate(process: subprocess.Popen[bytes]) -> None:

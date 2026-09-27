@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .catalog import ToolCatalog, ToolDescriptor
+from .types import RegistrationDetails
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -67,7 +68,8 @@ class ControlPlane:
                 msg = "input_ref is required"
                 raise ValueError(msg)
             record = self.headless.open(
-                input_ref, label=str(params.get("label", "headless"))
+                input_ref,
+                details=RegistrationDetails(label=str(params.get("label", "headless"))),
             )
             return _record_json(record)
         if method == "sessions/close":

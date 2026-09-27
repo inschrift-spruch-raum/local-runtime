@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import threading
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from .registry import InstanceRegistry
     from .types import InstanceRecord, Registration
+
+_logger = logging.getLogger(__name__)
 
 
 class RuntimeAdapter(Protocol):
@@ -72,11 +75,13 @@ class MultiModeRuntime:
         try:
             if record is not None:
                 self.registry.unregister(record.session_id, record.lease_id)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            _logger.exception("Failed to unregister runtime session")
             unregister_error = exc
         try:
             self.adapter.stop()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            _logger.exception("Failed to stop runtime adapter")
             if unregister_error is None:
                 unregister_error = exc
         if unregister_error is not None:
@@ -102,6 +107,7 @@ class MultiModeRuntime:
                 )
             try:
                 self.adapter.stop()
-            except Exception:  # noqa: BLE001
+            except Exception:
+                _logger.exception("Failed to stop adapter after lease loss")
                 return
             return
